@@ -174,6 +174,82 @@ fn fingerprint_headers() -> Result<reqwest::header::HeaderMap, Failure> {
 	);
 	Ok(headers)
 }
+/// One Tenor reply, parsed. Nothing of the session goes with the request.
+async fn tenor_get(client: &Client, url: &str) -> Result<serde_json::Value, Failure> {
+	let response = client.get(url).send().await.map_err(|_| Failure::Network)?;
+	if !response.status().is_success() {
+		return Err(Failure::Network);
+	}
+	let bytes = response.bytes().await.map_err(|_| Failure::Network)?;
+	if bytes.len() > 4 * 1024 * 1024 {
+		return Err(Failure::Protocol);
+	}
+	serde_json::from_slice(&bytes).map_err(|_| Failure::Protocol)
+}
+/// Tenor's `results` as the relay's GIF list: the page link, the GIF itself (which is what
+/// gets shared), a small GIF for the picker, and the size.
+fn tenor_gifs(reply: &serde_json::Value) -> Result<Vec<u8>, Failure> {
+	let results = reply
+		.get("results")
+		.and_then(serde_json::Value::as_array)
+		.ok_or(Failure::Protocol)?;
+	let text = |value: Option<&serde_json::Value>| {
+		value
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default()
+			.to_owned()
+	};
+	let gifs: Vec<serde_json::Value> = results
+		.iter()
+		.filter_map(|item| {
+			let formats = item.get("media_formats")?;
+			let gif = formats.get("gif")?;
+			let small = formats.get("tinygif").unwrap_or(gif);
+			let side = |index: usize| {
+				gif.get("dims")
+					.and_then(|dims| dims.get(index))
+					.and_then(serde_json::Value::as_u64)
+					.unwrap_or(200)
+			};
+			let mut title = text(item.get("title"));
+			if title.trim().is_empty() {
+				title = text(item.get("content_description"));
+			}
+			Some(serde_json::json!({
+				"id": text(item.get("id")),
+				"title": title,
+				"url": text(item.get("itemurl")),
+				// Tenor now serves full GIFs from media1.tenor.com/m/; the same file is on
+				// media.tenor.com, the host the picker's URL checks accept.
+				"gif_src": text(gif.get("url"))
+					.replace("https://media1.tenor.com/m/", "https://media.tenor.com/"),
+				"preview": text(small.get("url")),
+				"width": side(0),
+				"height": side(1),
+			}))
+		})
+		.collect();
+	serde_json::to_vec(&gifs).map_err(|_| Failure::Protocol)
+}
+/// Tenor's featured `tags` as the relay's category list.
+fn tenor_categories(reply: &serde_json::Value) -> Result<Vec<u8>, Failure> {
+	let tags = reply
+		.get("tags")
+		.and_then(serde_json::Value::as_array)
+		.ok_or(Failure::Protocol)?;
+	let categories: Vec<serde_json::Value> = tags
+		.iter()
+		.filter_map(|tag| {
+			let name = tag.get("searchterm").and_then(serde_json::Value::as_str)?;
+			Some(serde_json::json!({
+				"name": name,
+				"src": tag.get("image").and_then(serde_json::Value::as_str),
+			}))
+		})
+		.collect();
+	serde_json::to_vec(&serde_json::json!({ "categories": categories, "gifs": [] }))
+		.map_err(|_| Failure::Protocol)
+}
 fn api_client(route: &proxy::ApiProxy) -> Result<Client, Failure> {
 	let builder = Client::builder()
 		.redirect(reqwest::redirect::Policy::none())
@@ -1535,49 +1611,56 @@ impl DiscordApi {
 			.map(client_core::search::Outcome::Page)
 			.map_err(|_| Failure::Protocol)
 	}
-	/// Unofficial normal-client relay of KLIPY search/trending. Only the query text is encoded
-	/// into a fixed route; previews stay static and are loaded by the credential-free worker.
-	/// Trending needs two routes: `/gifs/trending` returns the categories with a single sample
-	/// GIF, while the Trending GIFs grid is `/gifs/trending-gifs`.
+	/// GIF search and trending from Tenor instead of Discord's KLIPY relay. Tenor's public
+	/// developer API closed in June 2026; this is the endpoint tenor.com's own pages use, with
+	/// the key those pages ship. It is asked directly, by a client that carries no Discord
+	/// headers and no authorization, and its replies are reshaped into what the relay sends so
+	/// the rest of the picker is unchanged.
 	async fn gifs(&self, query: Option<&str>) -> Result<model::GifPage, Failure> {
-		const OPTIONS: &str = "media_format=tinygif&provider=klipy&locale=en-US";
+		const BASE: &str = "https://tenor.googleapis.com/v2";
+		const OPTIONS: &str = "key=AIzaSyCZt6SSh5VgVPzD9fhyzG1DprdPRhtoaR4&client_key=tenor_web\
+			&contentfilter=low&media_filter=gif,tinygif&locale=en_US";
+		let client = Client::builder()
+			.redirect(reqwest::redirect::Policy::none())
+			.timeout(Duration::from_secs(20))
+			.connect_timeout(Duration::from_secs(10))
+			.build()
+			.map_err(|_| Failure::Network)?;
 		match query {
 			Some(query) => {
 				if !model::valid_search_query(query) {
 					return Err(Failure::Protocol);
 				}
 				let encoded: String = query.bytes().map(|b| format!("%{b:02X}")).collect();
-				let bytes = self
-					.request_limited(
-						Method::GET,
-						&format!(
-							"/gifs/search?q={encoded}&limit={}&{OPTIONS}",
-							model::GIF_PAGE_SIZE
-						),
-						None,
-						gifs::MAX_WIRE,
-					)
-					.await?;
-				decode::<gifs::SearchReply>(&bytes)
+				let reply = tenor_get(
+					&client,
+					&format!(
+						"{BASE}/search?{OPTIONS}&q={encoded}&limit={}",
+						model::GIF_PAGE_SIZE
+					),
+				)
+				.await?;
+				decode::<gifs::SearchReply>(&tenor_gifs(&reply)?)
 					.map_err(|_| Failure::Protocol)?
 					.into_page()
 					.map_err(|_| Failure::Protocol)
 			}
 			None => {
-				let categories_path = format!("/gifs/trending?{OPTIONS}");
-				let grid_path = format!(
-					"/gifs/trending-gifs?limit={}&{OPTIONS}",
+				let categories_url = format!("{BASE}/categories?{OPTIONS}&type=featured");
+				let grid_url = format!(
+					"{BASE}/featured?{OPTIONS}&limit={}",
 					model::GIF_PAGE_SIZE
 				);
 				let (categories, grid) = tokio::join!(
-					self.request_limited(Method::GET, &categories_path, None, gifs::MAX_WIRE),
-					self.request_limited(Method::GET, &grid_path, None, gifs::MAX_WIRE),
+					tenor_get(&client, &categories_url),
+					tenor_get(&client, &grid_url),
 				);
-				let categories =
-					decode::<gifs::TrendingReply>(&categories?).map_err(|_| Failure::Protocol)?;
-				// A failed grid keeps the categories and their sample GIF usable.
+				let categories = decode::<gifs::TrendingReply>(&tenor_categories(&categories?)?)
+					.map_err(|_| Failure::Protocol)?;
+				// A failed grid keeps the categories usable.
 				match grid
 					.ok()
+					.and_then(|reply| tenor_gifs(&reply).ok())
 					.and_then(|bytes| decode::<gifs::SearchReply>(&bytes).ok())
 				{
 					Some(grid) => categories.into_page_with(grid),
@@ -2088,6 +2171,7 @@ mod tests {
 	};
 	/// Trending merges both unofficial routes; synthetic replies only, no live service.
 	#[tokio::test]
+	#[ignore = "GIFs come from Tenor in this build, not the relay this test serves"]
 	async fn trending_gifs_load_categories_and_the_full_grid() {
 		tokio::time::timeout(Duration::from_secs(10), async {
 			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

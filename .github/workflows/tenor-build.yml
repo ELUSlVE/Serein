@@ -1,0 +1,43 @@
+name: Tenor build (Arch package)
+
+# This fork's only job: build the Arch package with GIFs coming from Tenor.
+# Run it by hand from the Actions tab, or it runs when the branch is pushed.
+on:
+  workflow_dispatch:
+  push:
+    branches: [tenor-gifs]
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build tools
+        run: bash packaging/linux/install-build-deps.sh
+      - name: Create unprivileged builder
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+      - name: Build the package
+        run: |
+          chown -R builder:builder /home/builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- env HOME=/home/builder bash <<'BUILD'
+            set -eu
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            export PATH="$HOME/.cargo/bin:$PATH"
+            rustup show active-toolchain
+            cargo xtask package --format arch
+          BUILD
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: serein-tenor-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 30
