@@ -4336,6 +4336,25 @@ impl MessagingUi {
 		{
 			self.search.focus_conversation(channel, state);
 		}
+		// Discord's own picker shortcuts: Ctrl+G for GIFs, Ctrl+S for stickers. Fixed, not
+		// in the remappable list. Pressed while the picker is open, they close it.
+		if state.selected.is_some() {
+			let (gifs, stickers) = ctx.input_mut(|input| {
+				(
+					input.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
+					input.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+				)
+			});
+			if gifs || stickers {
+				if self.emoji_picker.is_open() {
+					self.emoji_picker.dismiss(state, &mut commands);
+				} else if gifs {
+					self.emoji_picker.open_gifs("");
+				} else {
+					self.emoji_picker.open_stickers(None);
+				}
+			}
+		}
 		self.search.sync(&ctx, state, &mut commands);
 		let search_open =
 			self.search.results_visible(state) && state.selected.is_some() && !selected_voice;
